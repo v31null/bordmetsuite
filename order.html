@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.jsdelivr.net/npm/transliteration@2.3.5/dist/browser/bundle.umd.min.js"></script>
+</head>
+<body>
+
+    <input type="file" id="jsonUpload" accept=".json">
+    <br><br>
+    <div id="outputArea" style="font-family: sans-serif; line-height: 1.6;"></div>
+
+    <script>
+        const customAlphabet = [
+            "a", "b", "v", "u", "ú", "g", "d", "e", "j", "z", "i", "y", "k", "l", "m", 
+            "n", "o", "p", "r", "s", "t", "ù", "f", "ț", "č", "c", "q", "w", "x", "h"
+        ];
+
+        const charRankMap = new Map();
+        customAlphabet.forEach((char, index) => {
+            charRankMap.set(char.toLowerCase(), index);
+        });
+
+        function getCharRank(char) {
+            const lowerChar = char.toLowerCase();
+            return charRankMap.has(lowerChar) ? charRankMap.get(lowerChar) : 999;
+        }
+
+        function customSortComparator(a, b) {
+            const len = Math.min(a.length, b.length);
+            for (let i = 0; i < len; i++) {
+                const rankA = getCharRank(a[i]);
+                const rankB = getCharRank(b[i]);
+                
+                if (rankA !== rankB) {
+                    return rankA - rankB;
+                }
+            }
+            return a.length - b.length;
+        }
+
+        document.getElementById('jsonUpload').addEventListener('change', function(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    
+                    let processedNames = data.map(item => {
+                        const originalName = item.name || "";
+                        let romanized = originalName;
+                        
+                        if (typeof transliterate !== 'undefined') {
+                            romanized = transliterate(originalName);
+                        } else if (window.transliterator && typeof window.transliterator.transliterate === 'function') {
+                            romanized = window.transliterator.transliterate(originalName);
+                        }
+                        
+                        return romanized.toUpperCase();
+                    });
+
+                    processedNames.sort(customSortComparator);
+
+                    document.getElementById('outputArea').innerHTML = processedNames.join('<br>');
+
+                } catch (err) {
+                    document.getElementById('outputArea').innerHTML = "Error parsing JSON:<br>" + err.message;
+                }
+            };
+            
+            reader.readAsText(file);
+        });
+    </script>
+</body>
+</html>
