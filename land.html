@@ -357,6 +357,7 @@ textarea:focus { background: #060c14; }
     <button class="btn danger" id="btn-clear">CLEAR</button>
     <button class="btn" id="btn-undo">UNDO</button>
     <button class="btn" id="btn-close">CLOSE POLYGON</button>
+    <button class="btn gold" id="btn-follow-river">FOLLOW RIVER</button>
     <div class="sep"></div>
     <button class="btn gold" id="btn-gen">MAP→BORDMET</button>
     <button class="btn gold" id="btn-parse">PARSE→MAP</button>
@@ -368,6 +369,14 @@ textarea:focus { background: #060c14; }
     <button class="btn gold" id="btn-load-geojson">LOAD GEOJSON</button>
     <input type="file" id="in-geojson-file" accept=".geojson,.json" style="display:none">
     <button class="btn" id="btn-cp-overpass">COPY OVERPASS</button>
+    <div class="sep"></div>
+    <button class="btn gold" id="btn-upload-map">UPLOAD MAP</button>
+    <input type="file" id="in-map-img" accept="image/*" style="display:none">
+    <button class="btn" id="btn-add-ctrl">ADD CTRL PT</button>
+    <label style="display:flex;align-items:center;gap:5px;font-size:9px;letter-spacing:1px;color:var(--dim);text-transform:uppercase;white-space:nowrap">OPACITY
+        <input type="range" id="overlay-opacity" min="0" max="100" value="65" style="width:64px">
+    </label>
+    <button class="btn danger" id="btn-remove-map">REMOVE MAP</button>
 </div>
 
 <div id="main">
@@ -376,6 +385,11 @@ textarea:focus { background: #060c14; }
         <div id="map-loading">GEOCODING</div>
         <div id="map-mode-badge">DRAW MODE</div>
         <div id="map-edit-badge">EDIT MODE</div>
+        <div id="ctrl-panel" style="display:none;position:absolute;top:10px;right:10px;width:210px;max-height:60%;background:rgba(11,21,32,0.95);border:1px solid var(--gold);z-index:1000;flex-direction:column;overflow:hidden">
+            <div class="tp-hdr" style="border-bottom:1px solid var(--border)"><span>CALIBRATION PINS</span><span class="val warn" id="ctrl-count">0 SET</span></div>
+            <div id="ctrl-list" style="overflow-y:auto;flex:1"></div>
+            <div id="ctrl-corners" style="font-size:9px;color:var(--ok);padding:5px 8px;border-top:1px solid var(--border);white-space:normal;word-break:break-word"></div>
+        </div>
     </div>
 
     <div id="right">
@@ -461,13 +475,15 @@ textarea:focus { background: #060c14; }
 let pts = [];
 let ptData = [];
 let drawing = false;
+let ptMeta = [];
+
 let editing = false;
 let polyLayer = null;
 let markerLayers = [];
 let editMarkers = [];
 let segmentMarkers = [];
 
-const map = L.map('map', { center: [51.0, 13.0], zoom: 6 });
+const map = L.map('map', { center: [51.0, 13.0], zoom: 6, preferCanvas: true });
 
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
@@ -483,7 +499,33 @@ setTimeout(() => {
 }, 500);
 function toR(d) { return d * Math.PI / 180; }
 function toD(r) { return r * 180 / Math.PI; }
+function setMode(mode) {
+    drawing = mode === 'drawing';
+    editing = mode === 'editing';
+    followMode = mode === 'follow';
+    addingCtrl = mode === 'ctrl';
 
+    document.getElementById('btn-draw').classList.toggle('active', drawing);
+    document.getElementById('btn-edit').classList.toggle('active', editing);
+    document.getElementById('btn-follow-river').classList.toggle('active', followMode);
+    document.getElementById('btn-add-ctrl').classList.toggle('active', addingCtrl);
+    document.getElementById('map-mode-badge').style.display = drawing ? 'block' : 'none';
+    document.getElementById('map-edit-badge').style.display = editing ? 'block' : 'none';
+
+    map.getContainer().style.cursor = (drawing || followMode || addingCtrl) ? 'crosshair' : '';
+    document.getElementById('sb-mode').textContent = mode.toUpperCase();
+
+    if (riverStartMarker) { map.removeLayer(riverStartMarker); riverStartMarker = null; }
+    riverStart = null;
+
+    if (followMode) setStatus('FOLLOW RIVER — CLICK UPSTREAM POINT');
+    else if (addingCtrl) setStatus('CLICK A FEATURE ON THE OVERLAY, THEN DRAG TO REAL PLACE');
+    else if (drawing) setStatus('DRAWING');
+    else if (editing) setStatus('EDITING');
+    else setStatus('IDLE');
+
+    renderMap();
+}
 function destPt(lat, lon, brng, km) {
     const R = 6371, d = km / R, b = toR(brng);
     const la1 = toR(lat), lo1 = toR(lon);
@@ -566,57 +608,44 @@ async function generateBORDMET() {
     const work = isClosed() ? pts.slice(0,-1) : pts;
     const payload = work.map(p => [p[1], p[0]]);
 
-    try {
-        console.warn(`🚀 FIRING EXACTLY ONE POST REQUEST FOR ${payload.length} POINTS`);
-        
-        const postRes = await fetch(`https://api.geoapify.com/v1/batch/geocode/reverse?apiKey=${GEOAPIFY_KEY}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload) 
-        });
+    try {const CHUNK = 1000;
+const chunks = [];
+for (let i = 0; i < payload.length; i += CHUNK)
+    chunks.push(payload.slice(i, i + CHUNK));
 
-        if (!postRes.ok) throw new Error(`Batch POST failed: ${postRes.status}`);
-        const jobData = await postRes.json();
-        
-        setStatus(`BATCH ACCEPTED (JOB ID: ${jobData.id}). WAITING FOR SERVER...`);
-        let resultData = null;
-        
-        const checkUrl = jobData.url.includes('apiKey') ? jobData.url : `${jobData.url}&apiKey=${GEOAPIFY_KEY}`;
-
-        while (true) {
-            await new Promise(r => setTimeout(r, 3000)); 
-            
-            console.log("⏳ Checking if Geoapify is done...");
-            const getRes = await fetch(checkUrl);
-            if (!getRes.ok) throw new Error(`Batch GET failed: ${getRes.status}`);
-            
-            const checkData = await getRes.json();
-            if (getRes.status === 200) {
-                console.warn("✅ BATCH COMPLETE! DOWNLOADING RESULTS ARRAY.");
-                resultData = checkData;
-                break;
-            }
-        }
 const gd = new Array(work.length).fill(null);
-        
-        resultData.forEach((batchItem, i) => {
-            // Batch API returns flat objects, NOT GeoJSON features!
-            if (batchItem && batchItem.lat !== undefined && batchItem.lon !== undefined) {
-                const p = batchItem;
-                gd[i] = {
-                    lat: p.lat, lon: p.lon,
-                    address: {
-                        road: p.street || p.highway || p.path,
-                        house_number: p.housenumber,
-                        suburb: p.suburb || p.district || p.neighbourhood,
-                        municipality: p.municipality,
-                        city: p.city, town: p.town, village: p.village || p.hamlet,
-                        county: p.county, state_district: p.state
-                    }
-                };
-            }
-            ptData[i] = gd[i];
-        });
+let offset = 0;
+
+for (let ci = 0; ci < chunks.length; ci++) {
+    setStatus(`BATCH ${ci+1}/${chunks.length} — SUBMITTING ${chunks[ci].length} PTS...`);
+    const postRes = await fetch(`https://api.geoapify.com/v1/batch/geocode/reverse?apiKey=${GEOAPIFY_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(chunks[ci])
+    });
+    if (!postRes.ok) throw new Error(`Batch POST failed: ${postRes.status}`);
+    const jobData = await postRes.json();
+    const checkUrl = jobData.url.includes('apiKey') ? jobData.url : `${jobData.url}&apiKey=${GEOAPIFY_KEY}`;
+    let resultData = null;
+    while (true) {
+        await new Promise(r => setTimeout(r, 3000));
+        const getRes = await fetch(checkUrl);
+        if (!getRes.ok) throw new Error(`Batch GET failed: ${getRes.status}`);
+        const checkData = await getRes.json();
+        if (getRes.status === 200) { resultData = checkData; break; }
+    }
+    resultData.forEach((batchItem, i) => {
+        if (batchItem && batchItem.lat !== undefined) {
+            const p = batchItem;
+            gd[offset + i] = {
+                lat: p.lat, lon: p.lon,
+                address: { road: p.street||p.highway||p.path, house_number: p.housenumber, suburb: p.suburb||p.district||p.neighbourhood, municipality: p.municipality, city: p.city, town: p.town, village: p.village||p.hamlet, county: p.county, state_district: p.state }
+            };
+        }
+        ptData[offset + i] = gd[offset + i];
+    });
+    offset += chunks[ci].length;
+}
 
         setLoad(false);
         buildFromGeoData(gd, work);
@@ -805,7 +834,7 @@ function renderEditMarkers() {
                 if (pts.length >= 3) pts.push([...pts[0]]);
             } else {
                 pts.splice(i, 1);
-                ptData.splice(i, 1);
+                ptData.splice(i, 1);ptMeta.splice(i, 1);
             }
             renderMap();
             toast(`VERTEX ${i+1} DELETED`);
@@ -816,6 +845,7 @@ function renderEditMarkers() {
 }
 
 function renderMap() {
+    if (drawLine) { map.removeLayer(drawLine); drawLine = null; }
     if (polyLayer) { map.removeLayer(polyLayer); polyLayer = null; }
     markerLayers.forEach(m => map.removeLayer(m));
     markerLayers = [];
@@ -825,7 +855,15 @@ function renderMap() {
 
     if (editing) {
         renderEditMarkers();
+    } else if (pts.length > 8000) {
+        // pathologically dense border — drawing 8000+ vertex dots adds up; just mark the start
+        const m = L.circleMarker([pts[0][0], pts[0][1]], { radius: 7, color: '#e8a020', fillColor: '#e8a020', fillOpacity: 0.85, weight: 1.5 });
+        m.addTo(map);
+        markerLayers.push(m);
     } else {
+        // permanent numbered tooltips are a DOM node per vertex — only show them when there
+        // aren't many points, otherwise hundreds of tooltips make everything crawl.
+        const showTips = pts.length <= 80;
         pts.forEach((p, i) => {
             if (i === pts.length - 1 && isClosed()) return;
             const m = L.circleMarker([p[0],p[1]], {
@@ -835,7 +873,7 @@ function renderMap() {
                 fillOpacity: 0.85,
                 weight: 1.5
             });
-            m.bindTooltip(`${i+1}`, {permanent:true, direction:'right'});
+            if (showTips) m.bindTooltip(`${i+1}`, {permanent:true, direction:'right'});
             m.addTo(map);
             markerLayers.push(m);
         });
@@ -868,23 +906,24 @@ function updateStatus() {
 function updateVertexList() {
     const el = document.getElementById('point-list');
     document.getElementById('pt-count').textContent = pts.length + ' POINTS';
-    el.innerHTML = '';
-    pts.forEach((p, i) => {
-        const row = document.createElement('div');
-        row.className = 'pt-row';
+    // build one HTML string (far cheaper than appendChild + a listener per row)
+    let html = '';
+    for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
         const name = ptData[i] ? placeName(ptData[i]) : '';
-        row.innerHTML = `<span class="n">${i+1}</span><span class="c">${p[0].toFixed(5)}, ${p[1].toFixed(5)}</span><span class="p">${name}</span><span class="del" data-i="${i}">✕</span>`;
-        el.appendChild(row);
-    });
-    el.querySelectorAll('.del').forEach(d => {
-        d.addEventListener('click', e => {
-            const i = parseInt(e.target.dataset.i);
-            pts.splice(i,1);
-            ptData.splice(i,1);
-            renderMap();
-        });
-    });
+        html += `<div class="pt-row"><span class="n">${i+1}</span><span class="c">${p[0].toFixed(5)}, ${p[1].toFixed(5)}</span><span class="p">${name}</span><span class="del" data-i="${i}">✕</span></div>`;
+    }
+    el.innerHTML = html;
 }
+// one delegated listener handles every row's delete (instead of re-binding hundreds)
+document.getElementById('point-list').addEventListener('click', e => {
+    if (!e.target.classList.contains('del')) return;
+    const i = parseInt(e.target.dataset.i);
+    if (isNaN(i)) return;
+    pts.splice(i, 1);
+    ptData.splice(i, 1);ptMeta.splice(i, 1);
+    renderMap();
+});
 
 function updateRawGeoJSON() {
     if (pts.length < 2) return;
@@ -930,76 +969,97 @@ function buildFromGeoData(gd, work) {
     const ds = now.getUTCFullYear().toString()
         + String(now.getUTCMonth()+1).padStart(2,'0')
         + String(now.getUTCDate()).padStart(2,'0') + 'Z';
+const legStrs = [], legObjs = [];
+const cl = isClosed();
+const collapsed = [];
+let i2 = 0;
+while (i2 < work.length) {
+    const m = ptMeta[i2];
+    if (m && m.type === 'river') {
+        const start = i2, rname = m.name;
+        while (i2 < work.length && ptMeta[i2] && ptMeta[i2].type === 'river') i2++;
+        collapsed.push({ isRiver:true, name:rname, startPt:work[start], endPt:work[i2-1] });
+    } else {
+        collapsed.push({ isRiver:false, idx:i2, pt:work[i2], gd:gd[i2] });
+        i2++;
+    }
+}
+collapsed.forEach((entry, ei) => {
+    if (entry.isRiver) {
+    const dist = hav(entry.startPt[0],entry.startPt[1],entry.endPt[0],entry.endPt[1]);
+    const bd = brng(entry.startPt[0],entry.startPt[1],entry.endPt[0],entry.endPt[1]);
+    const card = String(Math.round(bd)).padStart(3,'0');
 
-    const legStrs = [], legObjs = [];
-    const cl = isClosed();
+    const prevE = ei > 0 ? collapsed[ei-1] : null;
+    const nextE = ei < collapsed.length-1 ? collapsed[ei+1] : null;
 
-    work.forEach((p, i) => {
-        const d = gd[i];
-        const act = i === 0 ? 'F' : 'M TW';
-        let str, obj;
-        if (d) {
-            const pn = placeName(d);
-            const pt_ = placeType(d);
-            const plat = parseFloat(d.lat);
-            const plon = parseFloat(d.lon);
-
-            let lastNamedEntity = null;
-            for (let j = i-1; j >= 0; j--) {
-                if (legObjs[j] && legObjs[j].entity && legObjs[j].entity.type !== 'FPP') {
-                    lastNamedEntity = legObjs[j].entity.name;
-                    break;
-                }
-            }
-            const sameAsPrev = lastNamedEntity && lastNamedEntity === pn;
-
-            if (sameAsPrev) {
-                const prevPt = work[i-1];
-                const fppDist = hav(prevPt[0], prevPt[1], p[0], p[1]);
-                const fppBd = brng(prevPt[0], prevPt[1], p[0], p[1]);
-                const fppCard = String(Math.round(fppBd)).padStart(3,'0');
-                const fppDstr = fmtDist(fppDist);
-                str = `${act} FPP O${fppDstr}@${fppCard}`;
-                obj = {
-                    seq: i, action: 'M', towards: true,
-                    entity: {type: 'FPP', name: 'FPP', coord: null},
-                    offset: {distKm: fppDist, bearing: fppBd, cardinal: fppCard},
-                    point: [p[0], p[1]],
-                    nominatim: d
-                };
-            } else if (isNaN(plat) || isNaN(plon)) {
-                str = pn === 'UNNAMED'
-                    ? `${act} ${pt_} ${pn} CO ${fmtCoord(p[0], p[1])}`
-                    : `${act} ${pt_} ${pn}`;
-                obj = {
-                    seq: i, action: i===0?'F':'M', towards: i>0,
-                    entity: {type:pt_, name:pn, coord:null},
-                    offset: null,
-                    point: [p[0], p[1]],
-                    nominatim: d
-                };
-            } else {
-                const dist = hav(plat, plon, p[0], p[1]);
-                const bd = brng(plat, plon, p[0], p[1]);
-                const card = String(Math.round(bd)).padStart(3,'0');
-                const dstr = fmtDist(dist);
-
-                str = dist < 0.05
-                    ? `${act} ${pt_} ${pn}${pn==='UNNAMED'?' CO '+fmtCoord(p[0],p[1]):''}`
-                    : `${act} ${pt_} ${pn} O${dstr}@${card}${pn==='UNNAMED'?' CO '+fmtCoord(p[0],p[1]):''}`;
-
-                obj = {
-                    seq: i, action: i===0?'F':'M', towards: i>0,
-                    entity: {type:pt_, name:pn, coord:[plat, plon]},
-                    offset: dist < 0.05 ? null : {distKm:dist, bearing:bd, cardinal:card},
-                    point: [p[0], p[1]],
-                    nominatim: d
-                };
-            }
+    let fromCtx = null;
+    if (prevE && !prevE.isRiver && prevE.gd) {
+        const plat = parseFloat(prevE.gd.lat), plon = parseFloat(prevE.gd.lon);
+        if (!isNaN(plat)) {
+            fromCtx = {
+                name: placeName(prevE.gd),
+                distKm: hav(entry.startPt[0],entry.startPt[1],plat,plon),
+                bearing: brng(plat,plon,entry.startPt[0],entry.startPt[1])
+            };
         }
-        legStrs.push(str);
-        legObjs.push(obj);
+    }
+
+    let toCtx = null;
+    if (nextE && !nextE.isRiver && nextE.gd) {
+        const plat = parseFloat(nextE.gd.lat), plon = parseFloat(nextE.gd.lon);
+        if (!isNaN(plat)) {
+            toCtx = {
+                name: placeName(nextE.gd),
+                distKm: hav(entry.endPt[0],entry.endPt[1],plat,plon),
+                bearing: brng(plat,plon,entry.endPt[0],entry.endPt[1])
+            };
+        }
+    }
+
+    legStrs.push(`FL RV ${entry.name} O${fmtDist(dist)}@${card}`);
+    legObjs.push({
+        seq:ei, action:'FL', towards:false,
+        entity:{type:'RV', name:entry.name, coord:null},
+        offset:{distKm:dist, bearing:bd, cardinal:card},
+        point:entry.endPt, nominatim:null,
+        riverContext:{ from:fromCtx, to:toCtx }
     });
+    return;
+}
+    const p = entry.pt, d = entry.gd;
+    const act = ei === 0 ? 'F' : 'M TW';
+    let str, obj;
+    if (d) {
+        const pn = placeName(d), pt_ = placeType(d);
+        const plat = parseFloat(d.lat), plon = parseFloat(d.lon);
+        let lastNamedEntity = null;
+        for (let j = legObjs.length-1; j >= 0; j--) {
+            if (legObjs[j]?.entity && legObjs[j].entity.type !== 'FPP' && legObjs[j].entity.type !== 'RV') { lastNamedEntity = legObjs[j].entity.name; break; }
+        }
+        const sameAsPrev = lastNamedEntity && lastNamedEntity === pn;
+        if (sameAsPrev) {
+            const prevPt = legObjs[legObjs.length-1].point;
+            const fppDist = hav(prevPt[0],prevPt[1],p[0],p[1]);
+            const fppBd = brng(prevPt[0],prevPt[1],p[0],p[1]);
+            const fppCard = String(Math.round(fppBd)).padStart(3,'0');
+            str = `${act} FPP O${fmtDist(fppDist)}@${fppCard}`;
+            obj = { seq:ei, action:'M', towards:true, entity:{type:'FPP',name:'FPP',coord:null}, offset:{distKm:fppDist,bearing:fppBd,cardinal:fppCard}, point:[p[0],p[1]], nominatim:d };
+        } else if (isNaN(plat)||isNaN(plon)) {
+            str = pn==='UNNAMED' ? `${act} ${pt_} ${pn} CO ${fmtCoord(p[0],p[1])}` : `${act} ${pt_} ${pn}`;
+            obj = { seq:ei, action:ei===0?'F':'M', towards:ei>0, entity:{type:pt_,name:pn,coord:null}, offset:null, point:[p[0],p[1]], nominatim:d };
+        } else {
+            const dist=hav(plat,plon,p[0],p[1]), bd=brng(plat,plon,p[0],p[1]);
+            const card=String(Math.round(bd)).padStart(3,'0'), dstr=fmtDist(dist);
+            str = dist<0.05 ? `${act} ${pt_} ${pn}${pn==='UNNAMED'?' CO '+fmtCoord(p[0],p[1]):''}` : `${act} ${pt_} ${pn} O${dstr}@${card}${pn==='UNNAMED'?' CO '+fmtCoord(p[0],p[1]):''}`;
+            obj = { seq:ei, action:ei===0?'F':'M', towards:ei>0, entity:{type:pt_,name:pn,coord:[plat,plon]}, offset:dist<0.05?null:{distKm:dist,bearing:bd,cardinal:card}, point:[p[0],p[1]], nominatim:d };
+        }
+    } else {
+        str = `${act} P UNNAMED CO ${fmtCoord(p[0],p[1])}`;
+        obj = { seq:ei, action:ei===0?'F':'M', towards:ei>0, entity:{type:'P',name:'UNNAMED',coord:null}, offset:null, point:[p[0],p[1]], nominatim:null };
+    }
+    legStrs.push(str); legObjs.push(obj);
+});
 
     const code = `BORDMET/1.5 ID=BORDER1 DATE=${ds} DATUM=WGS77 REF=OSM-v2026\n`
         + legStrs.join('\n') + (cl ? '\nCL' : '');
@@ -1037,6 +1097,19 @@ function buildProse(legs, cl) {
 
     let p = '';
     legs.forEach((leg, i) => {
+        if (leg.action === 'FL') {
+    const ctx = leg.riverContext || {};
+    let s = `; thence following the course of the river ${leg.entity.name}`;
+    if (ctx.from) {
+        s += `, from a point ${distW(ctx.from.distKm)} ${dWords(ctx.from.bearing)} of ${ctx.from.name}`;
+    }
+    s += `, proceeding generally ${dWords(leg.offset.bearing)} for approximately ${distW(leg.offset.distKm)}`;
+    if (ctx.to) {
+        s += `, arriving at a point ${distW(ctx.to.distKm)} ${dWords(ctx.to.bearing)} of ${ctx.to.name}`;
+    }
+    p += s;
+    return;
+}
         if (leg.entity.type === 'FPP') {
             const dir = dWords(leg.offset.bearing);
             const dist = distW(leg.offset.distKm);
@@ -1086,8 +1159,7 @@ function buildFullGeoJSON(legs, cl, code, prose) {
     };
     document.getElementById('ta-geojson').value = JSON.stringify(gj, null, 2);
 }
-
-const ACTS = new Set(['F','M','U','A']);
+const ACTS = new Set(['F','M','U','A','FL']);
 const ENTS = new Set(['C','T','V','P','RV','RD','ST','MT','LK','BR','CR','CO']);
 const KWS  = new Set(['F','M','U','A','CL','TW','FL','CRV','INT','ADJ','CO','RMK','PAR','EXCL','INCL','AUTO','COR']);
 
@@ -1116,6 +1188,16 @@ async function parseBORDMET() {
             const leg = {action:t, towards:false, entity:null, offset:null};
             i++;
             if (toks[i]==='TW') { leg.towards=true; i++; }
+            if (t === 'FL') {
+    leg.action = 'FL';
+    if (toks[i] === 'RV') {
+        leg.entity = { type:'RV', name:'', coord:null };
+        i++;
+        const parts = [];
+        while (i < toks.length && !isModTok(toks[i])) { parts.push(toks[i]); i++; }
+        leg.entity.name = parts.join(' ');
+    }
+}
             if (i < toks.length && toks[i] === 'FPP') {
                 leg.entity = {type:'FPP', name:'FPP', coord:null};
                 i++;
@@ -1159,6 +1241,13 @@ async function parseBORDMET() {
 
     for (const leg of toRender) {
         if (!leg.entity) continue;
+        if (leg.action === 'FL') {
+    const prev = resolved.length > 0 ? resolved[resolved.length - 1] : null;
+    if (prev && leg.offset) {
+        resolved.push(destPt(prev[0], prev[1], leg.offset.bd, leg.offset.km));
+    }
+    continue;
+}
         if (leg.entity.type === 'FPP') {
             const prev = resolved.length > 0 ? resolved[resolved.length - 1] : null;
             if (prev) {
@@ -1195,6 +1284,7 @@ async function parseBORDMET() {
 
     pts = resolved;
     ptData = new Array(pts.length).fill(null);
+    ptMeta = new Array(pts.length).fill(null);
     renderMap();
     if (pts.length > 0) {
         map.fitBounds(L.latLngBounds(pts.map(p=>[p[0],p[1]])), {padding:[40,40]});
@@ -1204,10 +1294,31 @@ async function parseBORDMET() {
 }
 
 let isDrawingDrag = false;
+let drawLine = null;      // single live preview line used while drag-drawing
+let _drawRAF = null;      // pending animation-frame redraw
+let drewThisStroke = false;
+
+// fast path while dragging: coalesce all points added this frame into ONE polyline redraw.
+// (setLatLngs reprojects every point, so calling it per-mousemove is O(n^2) — rAF caps it.)
+function liveDrawUpdate() {
+    drewThisStroke = true;
+    if (polyLayer) { map.removeLayer(polyLayer); polyLayer = null; }
+    if (_drawRAF) return; // a redraw is already queued for this frame
+    _drawRAF = requestAnimationFrame(() => {
+        _drawRAF = null;
+        if (!drawLine) {
+            drawLine = L.polyline(pts, { color:'#00d4ff', weight:1.5, dashArray:'7,4' }).addTo(map);
+        } else {
+            drawLine.setLatLngs(pts);
+        }
+        document.getElementById('sb-pts').textContent = pts.length;
+    });
+}
 
 map.on('mousedown', e => {
     if (!drawing || (e.originalEvent && e.originalEvent.button !== 0)) return; // Only left-click
     isDrawingDrag = true;
+    drewThisStroke = false;
     map.dragging.disable(); // Prevent the map from panning while dragging to draw
 });
 
@@ -1230,8 +1341,8 @@ map.on('mousemove', e => {
         // Add point if we dragged far enough based on the zoom level
         if (dist >= thresholdKm) {
             pts.push([e.latlng.lat, e.latlng.lng]);
-            ptData.push(null);
-            renderMap();
+            ptData.push(null);ptMeta.push(null);
+            liveDrawUpdate(); // cheap incremental redraw; full render happens on mouseup
         }
     }
 });
@@ -1240,6 +1351,12 @@ map.on('mouseup', () => {
     if (!drawing) return;
     isDrawingDrag = false;
     map.dragging.enable(); // Restore normal map panning
+    if (drewThisStroke) {
+        // drag finished — cancel any queued frame and do the full render exactly once
+        if (_drawRAF) { cancelAnimationFrame(_drawRAF); _drawRAF = null; }
+        drewThisStroke = false;
+        renderMap();
+    }
 });
 
 map.on('click', e => {
@@ -1253,62 +1370,40 @@ map.on('click', e => {
     }
 
     pts.push([e.latlng.lat, e.latlng.lng]);
-    ptData.push(null);
+    ptData.push(null);ptMeta.push(null);
     renderMap();
 });
 
 map.on('contextmenu', e => {
     if (!drawing) return;
     if (pts.length > 0) {
-        pts.pop(); ptData.pop();
+        pts.pop(); ptData.pop();ptMeta.pop();
         renderMap();
         toast('LAST VERTEX REMOVED');
     }
 });
+document.getElementById('btn-draw').addEventListener('click', () => setMode(drawing ? 'idle' : 'drawing'));
 
-document.getElementById('btn-draw').addEventListener('click', function() {
-    drawing = !drawing;
-    if (drawing && editing) {
-        editing = false;
-        document.getElementById('btn-edit').classList.remove('active');
-        document.getElementById('map-edit-badge').style.display = 'none';
-        renderMap();
-    }
-    this.classList.toggle('active', drawing);
-    document.getElementById('map-mode-badge').style.display = drawing ? 'block' : 'none';
-    document.getElementById('sb-mode').textContent = drawing ? 'DRAWING' : 'IDLE';
-    map.getContainer().style.cursor = drawing ? 'crosshair' : '';
+document.getElementById('btn-edit').addEventListener('click', () => {
+    if (pts.length === 0) { toast('NO POINTS TO EDIT'); return; }
+    setMode(editing ? 'idle' : 'editing');
 });
 
-document.getElementById('btn-edit').addEventListener('click', function() {
-    if (pts.length === 0) { toast('NO POINTS TO EDIT'); return; }
-    editing = !editing;
-    if (editing && drawing) {
-        drawing = false;
-        document.getElementById('btn-draw').classList.remove('active');
-        document.getElementById('map-mode-badge').style.display = 'none';
-        map.getContainer().style.cursor = '';
-    }
-    this.classList.toggle('active', editing);
-    document.getElementById('map-edit-badge').style.display = editing ? 'block' : 'none';
-    document.getElementById('sb-mode').textContent = editing ? 'EDITING' : 'IDLE';
-    renderMap();
+document.getElementById('btn-follow-river').addEventListener('click', () => setMode(followMode ? 'idle' : 'follow'));
+
+document.getElementById('btn-add-ctrl').addEventListener('click', () => {
+    if (!ovImg) { toast('UPLOAD A MAP IMAGE FIRST'); return; }
+    setMode(addingCtrl ? 'idle' : 'ctrl');
 });
 
 document.getElementById('btn-clear').addEventListener('click', function() {
-    pts=[]; ptData=[];
+    pts=[]; ptData=[]; ptMeta=[];
+    if (drawLine) { map.removeLayer(drawLine); drawLine=null; }
     if (polyLayer) { map.removeLayer(polyLayer); polyLayer=null; }
     markerLayers.forEach(m=>map.removeLayer(m));
     markerLayers=[];
     clearEditMarkers();
-    drawing=false;
-    editing=false;
-    document.getElementById('btn-draw').classList.remove('active');
-    document.getElementById('btn-edit').classList.remove('active');
-    document.getElementById('map-mode-badge').style.display='none';
-    document.getElementById('map-edit-badge').style.display='none';
-    document.getElementById('sb-mode').textContent='IDLE';
-    map.getContainer().style.cursor='';
+    setMode('idle');
     ['ta-bordmet','ta-prose','ta-bjson','ta-geojson','ta-overpass'].forEach(id=>document.getElementById(id).value='');
     document.getElementById('point-list').innerHTML='';
     document.getElementById('pt-count').textContent='0 POINTS';
@@ -1320,7 +1415,7 @@ document.getElementById('btn-clear').addEventListener('click', function() {
 
 document.getElementById('btn-undo').addEventListener('click', function() {
     if (pts.length === 0) return;
-    pts.pop(); ptData.pop();
+    pts.pop(); ptData.pop(); ptMeta.pop();
     renderMap();
     toast('VERTEX REMOVED');
 });
@@ -1329,7 +1424,7 @@ document.getElementById('btn-close').addEventListener('click', function() {
     if (pts.length < 3) { toast('NEED AT LEAST 3 POINTS'); return; }
     if (!isClosed()) {
         pts.push([...pts[0]]);
-        ptData.push(null);
+        ptData.push(null); ptMeta.push(null);
         renderMap();
         toast('POLYGON CLOSED');
     } else {
@@ -1358,6 +1453,9 @@ document.getElementById('btn-cp-overpass').addEventListener('click', function() 
     navigator.clipboard.writeText(v).then(()=>toast('OVERPASS QUERY COPIED'));
 });
 
+document.getElementById('btn-add-pt').addEventListener('click', addManualPt);
+document.getElementById('in-lon').addEventListener('keydown', e=>{ if(e.key==='Enter') addManualPt(); });
+
 document.querySelectorAll('.copy-btn[data-src]').forEach(btn => {
     btn.addEventListener('click', () => {
         const v = document.getElementById(btn.dataset.src).value;
@@ -1373,17 +1471,19 @@ document.querySelectorAll('.tab').forEach(tab => {
 function switchTab(name) {
     document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
     document.querySelectorAll('.tp').forEach(p=>p.classList.toggle('on',p.id==='tp-'+name));
-}
-
-document.getElementById('btn-add-pt').addEventListener('click', addManualPt);
-document.getElementById('in-lon').addEventListener('keydown', e=>{ if(e.key==='Enter') addManualPt(); });
-
+}document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key === '1') setMode(drawing ? 'idle' : 'drawing');
+    if (e.key === '2') setMode(followMode ? 'idle' : 'follow');
+    if (e.key === '3') { if (pts.length === 0) return; pts.pop(); ptData.pop(); ptMeta.pop(); renderMap(); toast('VERTEX REMOVED'); }
+    if (e.key === '4') document.getElementById('btn-clear').click();
+});
 function addManualPt() {
     const la = parseFloat(document.getElementById('in-lat').value);
     const lo = parseFloat(document.getElementById('in-lon').value);
     if (isNaN(la)||isNaN(lo)) { toast('INVALID COORDINATES'); return; }
     if (la<-90||la>90||lo<-180||lo>180) { toast('OUT OF RANGE'); return; }
-    pts.push([la,lo]); ptData.push(null);
+    pts.push([la,lo]); ptData.push(null);ptMeta.push(null);
     renderMap();
     map.setView([la,lo], Math.max(map.getZoom(),8));
     document.getElementById('in-lat').value='';
@@ -1422,6 +1522,7 @@ function loadFromJSON(file) {
 
         pts = [];
         ptData = [];
+        ptMeta = [];
 
         const legs = data.legs;
         const cl = data.closure && data.closure.valid;
@@ -1431,6 +1532,7 @@ function loadFromJSON(file) {
             pts.push([leg.point[0], leg.point[1]]);
             ptData.push(leg.nominatim || null);
         });
+        ptMeta = new Array(pts.length).fill(null);
 
         if (cl && pts.length >= 3) {
             const f = pts[0], l = pts[pts.length-1];
@@ -1491,6 +1593,7 @@ function renderSegmentHitTargets() {
             L.DomEvent.stopPropagation(e);
             pts.splice(idx + 1, 0, [midLat, midLon]);
             ptData.splice(idx + 1, 0, null);
+            ptMeta.splice(idx + 1, 0, null);
             renderMap();
             toast(`NODE INSERTED AT SEGMENT ${idx + 1}`);
         });
@@ -1537,6 +1640,7 @@ function loadFromGeoJSON(file) {
 
         pts = extracted;
         ptData = new Array(pts.length).fill(null);
+        ptMeta = new Array(pts.length).fill(null);
 
         renderMap();
         map.fitBounds(L.latLngBounds(pts.map(p => [p[0], p[1]])), { padding: [40, 40] });
@@ -1554,6 +1658,433 @@ document.getElementById('btn-load-geojson').addEventListener('click', () => {
 
 document.getElementById('in-geojson-file').addEventListener('change', function() {
     if (this.files && this.files[0]) loadFromGeoJSON(this.files[0]);
+});
+
+/* ============================================================
+   MAP OVERLAY — georeference an uploaded map image onto the OSM
+   base using calibration points (SAME LOGIC AS map.html):
+   solveAffine() fits a least-squares affine + inverse-distance
+   residual rubber-sheet from pixel<->geo control points. Drop a
+   pin on a feature in your image, drag it to that feature's real
+   place; with 2+ pins the image warps itself to fit. Then trace.
+   ============================================================ */
+
+// ---- affine solver (ported verbatim from map.html) ----
+function solveAffine(pts, getU, getV, getX, getY) {
+    let n = pts.length;
+    if (n < 2) return null;
+    let baseTransform;
+    if (n === 2) {
+        let p1 = pts[0], p2 = pts[1];
+        let du = getU(p2) - getU(p1), dv = getV(p2) - getV(p1);
+        let scx = du !== 0 ? (getX(p2) - getX(p1)) / du : 0;
+        let scy = dv !== 0 ? (getY(p2) - getY(p1)) / dv : 0;
+        let ox = getX(p1) - getU(p1) * scx, oy = getY(p1) - getV(p1) * scy;
+        baseTransform = (u, v) => ({ x: u * scx + ox, y: v * scy + oy });
+    } else {
+        let su = 0, sv = 0, suu = 0, svv = 0, suv = 0, sx = 0, sy = 0, sux = 0, suy = 0, svx = 0, svy = 0;
+        for (let p of pts) {
+            let u = getU(p), v = getV(p), x = getX(p), y = getY(p);
+            su += u; sv += v; suu += u * u; svv += v * v; suv += u * v;
+            sx += x; sy += y; sux += u * x; svx += v * x; suy += u * y; svy += v * y;
+        }
+        let det = suu * (svv * n - sv * sv) - suv * (suv * n - su * sv) + su * (suv * sv - svv * su);
+        if (Math.abs(det) < 1e-9) {
+            let p1 = pts[0], p2 = pts[1];
+            let du = getU(p2) - getU(p1), dv = getV(p2) - getV(p1);
+            let scx = du !== 0 ? (getX(p2) - getX(p1)) / du : 0, scy = dv !== 0 ? (getY(p2) - getY(p1)) / dv : 0;
+            let ox = getX(p1) - getU(p1) * scx, oy = getY(p1) - getV(p1) * scy;
+            baseTransform = (u, v) => ({ x: u * scx + ox, y: v * scy + oy });
+        } else {
+            function solveM(rx, ry, rz) {
+                let a = rx * (svv * n - sv * sv) - suv * (ry * n - sv * rz) + su * (ry * sv - svv * rz);
+                let b = suu * (ry * n - sv * rz) - rx * (suv * n - su * sv) + su * (suv * rz - ry * su);
+                let c = suu * (svv * rz - sv * ry) - suv * (suv * rz - su * ry) + rx * (suv * sv - svv * su);
+                return { a: a / det, b: b / det, c: c / det };
+            }
+            let mapX = solveM(sux, svx, sx), mapY = solveM(suy, svy, sy);
+            baseTransform = (u, v) => ({ x: mapX.a * u + mapX.b * v + mapX.c, y: mapY.a * u + mapY.b * v + mapY.c });
+        }
+    }
+    if (n <= 2) return baseTransform;
+    let residuals = pts.map((p) => {
+        let u = getU(p), v = getV(p), base = baseTransform(u, v);
+        return { u, v, dx: getX(p) - base.x, dy: getY(p) - base.y };
+    });
+    return (u, v) => {
+        let base = baseTransform(u, v);
+        let sumWeight = 0, sumDx = 0, sumDy = 0;
+        for (let r of residuals) {
+            let distSq = (u - r.u) * (u - r.u) + (v - r.v) * (v - r.v);
+            if (distSq < 1e-12) return { x: base.x + r.dx, y: base.y + r.dy };
+            let weight = 1.0 / distSq;
+            sumWeight += weight; sumDx += r.dx * weight; sumDy += r.dy * weight;
+        }
+        return { x: base.x + sumDx / sumWeight, y: base.y + sumDy / sumWeight };
+    };
+}
+
+// ---- overlay state ----
+let ovImg = null;        // <img> in the leaflet overlay pane — THIS warps to fit
+let ovW = 0, ovH = 0;    // natural image size
+let ctrlPts = [];        // [{id, imgX, imgY, realLL, marker, _dragging}]  (imgX/imgY = fixed image pixel)
+let addingCtrl = false;
+let ovPlacement = null;  // base display corners {nw,ne,sw} used before 2 points are set
+let curMatrix = null;    // current image-pixel -> layerPoint affine {a,b,c,d,e,f}
+
+function ovOpacity() { return (parseInt(document.getElementById('overlay-opacity').value) || 0) / 100; }
+
+// latlng -> layerPoint (handles the zoom-animation frame)
+function projLL(ll, e) {
+    return (e && e.zoom !== undefined && map._latLngToNewLayerPoint)
+        ? map._latLngToNewLayerPoint(ll, e.zoom, e.center)
+        : map.latLngToLayerPoint(ll);
+}
+function applyMx(M, u, v) { return { x: M.a * u + M.c * v + M.e, y: M.b * u + M.d * v + M.f }; }
+function invMx(M, x, y) {
+    const det = M.a * M.d - M.b * M.c; if (Math.abs(det) < 1e-12) return null;
+    const dx = x - M.e, dy = y - M.f;
+    return { x: (dx * M.d - dy * M.c) / det, y: (-dx * M.b + dy * M.a) / det };
+}
+
+// Build the image-pixel -> layerPoint matrix. SAME LOGIC AS map.html: solveAffine over the
+// control points (pixel -> target layer point). A point being dragged uses its live position
+// so the image warps to follow. <2 correspondences -> base placement (+translate for 1).
+function buildMatrix(e) {
+    const corr = ctrlPts.filter(p => p.realLL || p._dragging);
+    const targ = p => projLL(p._dragging ? p.marker.getLatLng() : p.realLL, e);
+    if (corr.length >= 2) {
+        const t = solveAffine(corr, p => p.imgX, p => p.imgY, p => targ(p).x, p => targ(p).y);
+        const A = t(0, 0), B = t(ovW, 0), C = t(0, ovH);
+        return { a: (B.x - A.x) / ovW, b: (B.y - A.y) / ovW, c: (C.x - A.x) / ovH, d: (C.y - A.y) / ovH, e: A.x, f: A.y };
+    }
+    const PA = projLL(ovPlacement.nw, e), PB = projLL(ovPlacement.ne, e), PC = projLL(ovPlacement.sw, e);
+    const M = { a: (PB.x - PA.x) / ovW, b: (PB.y - PA.y) / ovW, c: (PC.x - PA.x) / ovH, d: (PC.y - PA.y) / ovH, e: PA.x, f: PA.y };
+    if (corr.length === 1) {
+        const p = corr[0], want = targ(p), got = applyMx(M, p.imgX, p.imgY);
+        M.e += want.x - got.x; M.f += want.y - got.y;
+    }
+    return M;
+}
+
+// re-warp the image and glue every pin to its image feature (pins ride WITH the image)
+function renderOverlay(e) {
+    if (!ovImg || !ovW || !ovPlacement) return;
+    const M = buildMatrix(e); curMatrix = M;
+    ovImg.style.transformOrigin = '0 0';
+    ovImg.style.transform = `matrix(${M.a},${M.b},${M.c},${M.d},${M.e},${M.f})`;
+    const anim = e && e.zoom !== undefined;
+    if (!anim) {
+        ctrlPts.forEach(cp => {
+            if (cp._dragging) return; // leave the one under the cursor alone
+            const lp = applyMx(M, cp.imgX, cp.imgY);
+            cp.marker.setLatLng(map.layerPointToLatLng(L.point(lp.x, lp.y)));
+        });
+        updateCornersText(M);
+    }
+}
+
+function updateCornersText(M) {
+    const cd = document.getElementById('ctrl-corners'); if (!cd) return;
+    if (ctrlPts.filter(p => p.realLL).length < 2) { cd.textContent = ''; return; }
+    const cs = [[0, 0], [ovW, 0], [ovW, ovH], [0, ovH]].map(([u, v]) => {
+        const lp = applyMx(M, u, v); return map.layerPointToLatLng(L.point(lp.x, lp.y));
+    });
+    cd.textContent = 'BOUNDS  ' + cs.map((c, i) => `C${i + 1} ${c.lat.toFixed(4)},${c.lng.toFixed(4)}`).join('   ');
+}
+
+function loadMapOverlay(dataUrl) {
+    removeOverlay();
+    const img = L.DomUtil.create('img', '', map.getPanes().overlayPane);
+    img.style.position = 'absolute';
+    img.style.left = '0'; img.style.top = '0';
+    img.style.pointerEvents = 'none';
+    img.style.opacity = ovOpacity();
+    img.draggable = false;
+    img.onload = () => {
+        ovW = img.naturalWidth; ovH = img.naturalHeight;
+        const b = map.getBounds().pad(-0.15);
+        ovPlacement = { nw: b.getNorthWest(), ne: b.getNorthEast(), sw: b.getSouthWest() };
+        renderOverlay();
+        renderCtrlList();
+        setStatus('OVERLAY ADDED — PIN A FEATURE (PIN STICKS TO IT), DRAG IT TO ITS REAL PLACE');
+    };
+    img.src = dataUrl;
+    ovImg = img;
+}
+
+function removeOverlay() {
+    if (ovImg) { ovImg.remove(); ovImg = null; }
+    ctrlPts.forEach(p => { if (p.marker) map.removeLayer(p.marker); });
+    ctrlPts = []; ovPlacement = null; curMatrix = null; ovW = 0; ovH = 0;
+    addingCtrl = false;
+    document.getElementById('btn-add-ctrl').classList.remove('active');
+    renderCtrlList();
+}
+
+function ctrlIcon(i, set) {
+    const bg = set ? '#00e890' : '#e8a020';
+    return L.divIcon({
+        className: '', iconSize: [18, 18], iconAnchor: [9, 9],
+        html: `<div style="width:18px;height:18px;background:${bg};border:2px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;color:#000;font-weight:bold;box-shadow:0 0 5px rgba(0,0,0,0.8);cursor:move">${i}</div>`
+    });
+}
+
+// click pins a feature on the overlay (lands exactly under the cursor and stays stuck to it);
+// drag the pin to that feature's real place -> the image warps so the pin (and image) line up.
+function addCtrlPoint(latlng) {
+    if (!ovImg || !curMatrix) { toast('UPLOAD A MAP IMAGE FIRST'); return; }
+    const lp = map.latLngToLayerPoint(latlng);
+    const px = invMx(curMatrix, lp.x, lp.y) || { x: ovW / 2, y: ovH / 2 };
+    const cp = { id: Date.now() + Math.floor(Math.random() * 1000), imgX: px.x, imgY: px.y, realLL: null, _dragging: false, marker: null };
+    const feat = applyMx(curMatrix, px.x, px.y);
+    const marker = L.marker(map.layerPointToLatLng(L.point(feat.x, feat.y)), { icon: ctrlIcon(ctrlPts.length + 1, false), draggable: true }).addTo(map);
+    marker.on('dragstart', () => { cp._dragging = true; });
+    marker.on('drag', () => { renderOverlay(); });           // live: image follows the pin
+    marker.on('dragend', () => {
+        cp.realLL = marker.getLatLng();
+        cp._dragging = false;
+        renderOverlay();                                     // re-warp; pin snaps onto its (now aligned) feature
+        marker.setIcon(ctrlIcon(ctrlPts.indexOf(cp) + 1, true));
+        renderCtrlList();
+        toast('REAL PLACE SET — IMAGE ALIGNED');
+    });
+    marker.on('click', ev => L.DomEvent.stopPropagation(ev));
+    cp.marker = marker;
+    ctrlPts.push(cp);
+    renderOverlay();
+    renderCtrlList();
+    toast(`PIN ${ctrlPts.length} STUCK TO FEATURE — DRAG IT TO ITS REAL PLACE`);
+}
+
+function deleteCtrlPoint(id) {
+    const i = ctrlPts.findIndex(p => p.id === id); if (i < 0) return;
+    if (ctrlPts[i].marker) map.removeLayer(ctrlPts[i].marker);
+    ctrlPts.splice(i, 1);
+    ctrlPts.forEach((p, idx) => { if (p.marker) p.marker.setIcon(ctrlIcon(idx + 1, !!p.realLL)); });
+    renderOverlay(); renderCtrlList();
+}
+
+function renderCtrlList() {
+    const panel = document.getElementById('ctrl-panel');
+    panel.style.display = ovImg ? 'flex' : 'none';
+    const el = document.getElementById('ctrl-list');
+    el.innerHTML = '';
+    ctrlPts.forEach((p, idx) => {
+        const row = document.createElement('div');
+        row.className = 'pt-row';
+        const loc = p.realLL ? `${p.realLL.lat.toFixed(5)}, ${p.realLL.lng.toFixed(5)}` : '⤴ DRAG TO REAL PLACE';
+        row.innerHTML = `<span class="n">P${idx + 1}</span><span class="c">${loc}</span><span class="del" data-id="${p.id}">✕</span>`;
+        el.appendChild(row);
+    });
+    el.querySelectorAll('.del').forEach(d => d.addEventListener('click', e => deleteCtrlPoint(parseInt(e.target.dataset.id))));
+    const cnt = ctrlPts.filter(p => p.realLL).length;
+    const cc = document.getElementById('ctrl-count');
+    cc.textContent = cnt + (cnt >= 2 ? ' SET · ALIGNED' : ' SET · NEED 2+');
+    cc.className = 'val ' + (cnt >= 2 ? 'ok' : 'warn');
+    if (!ovImg) { const cd = document.getElementById('ctrl-corners'); if (cd) cd.textContent = ''; }
+}
+
+// the image re-warps on every view change; pins stay glued to their features
+map.on('zoomanim', renderOverlay);
+map.on('zoom viewreset move zoomend moveend', () => renderOverlay());
+// in add-ctrl mode, a map click pins a feature on the overlay
+map.on('click', e => { if (addingCtrl) addCtrlPoint(e.latlng); });
+
+document.getElementById('btn-upload-map').addEventListener('click', () => {
+    const f = document.getElementById('in-map-img'); f.value = ''; f.click();
+});
+document.getElementById('in-map-img').addEventListener('change', function() {
+    if (!this.files || !this.files[0]) return;
+    const r = new FileReader();
+    r.onload = e => loadMapOverlay(e.target.result);
+    r.readAsDataURL(this.files[0]);
+});
+document.getElementById('overlay-opacity').addEventListener('input', () => { if (ovImg) ovImg.style.opacity = ovOpacity(); });
+document.getElementById('btn-remove-map').addEventListener('click', () => {
+    if (!ovImg) { toast('NO OVERLAY'); return; }
+    removeOverlay();
+    map.getContainer().style.cursor = '';
+    setStatus('OVERLAY REMOVED');
+    toast('MAP OVERLAY REMOVED');
+});
+
+/* ============================================================
+   FOLLOW RIVER — click an upstream point and a downstream point on
+   a river; we pull the OSM waterway geometry between them and walk
+   the river network (Dijkstra) so the border follows its real course.
+   ============================================================ */
+let followMode = false;
+let riverStart = null;
+let riverStartMarker = null;
+
+class MinHeap {
+    constructor() { this.a = []; }
+    isEmpty() { return this.a.length === 0; }
+    push(key, prio) {
+        const a = this.a; a.push({ key, prio }); let i = a.length - 1;
+        while (i > 0) { const p = (i - 1) >> 1; if (a[p].prio <= a[i].prio) break; [a[p], a[i]] = [a[i], a[p]]; i = p; }
+    }
+    pop() {
+        const a = this.a, top = a[0], last = a.pop();
+        if (a.length > 0) {
+            a[0] = last; let i = 0; const n = a.length;
+            while (true) {
+                let l = 2 * i + 1, r = 2 * i + 2, s = i;
+                if (l < n && a[l].prio < a[s].prio) s = l;
+                if (r < n && a[r].prio < a[s].prio) s = r;
+                if (s === i) break;
+                [a[s], a[i]] = [a[i], a[s]]; i = s;
+            }
+        }
+        return top;
+    }
+}
+
+async function overpassFetch(query) {
+    const servers = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+        'https://overpass.private.coffee/api/interpreter'
+    ];
+    let lastErr;
+    for (const s of servers) {
+        try {
+            const res = await fetch(s, { method: 'POST', body: 'data=' + encodeURIComponent(query) });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.json();
+        } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('all overpass servers failed');
+}
+
+// build a graph from waterway segments, snap a/b to nearest river vertices, Dijkstra the path
+function riverPath(data, a, b) {
+    const els = (data && data.elements) || [];
+    const key = (lat, lon) => lat.toFixed(6) + ',' + lon.toFixed(6);
+    const adj = new Map();      // key -> [{k, w}]
+    const coordOf = new Map();  // key -> [lat,lon]
+    function addEdge(p1, p2) {
+        const k1 = key(p1[0], p1[1]), k2 = key(p2[0], p2[1]);
+        if (k1 === k2) return;
+        coordOf.set(k1, p1); coordOf.set(k2, p2);
+        const w = hav(p1[0], p1[1], p2[0], p2[1]);
+        if (!adj.has(k1)) adj.set(k1, []);
+        if (!adj.has(k2)) adj.set(k2, []);
+        adj.get(k1).push({ k: k2, w });
+        adj.get(k2).push({ k: k1, w });
+    }
+    for (const el of els) {
+        if (el.type === 'way' && el.geometry && el.geometry.length > 1) {
+            for (let i = 0; i < el.geometry.length - 1; i++) {
+                const g1 = el.geometry[i], g2 = el.geometry[i + 1];
+                addEdge([g1.lat, g1.lon], [g2.lat, g2.lon]);
+            }
+        }
+    }
+    if (adj.size === 0) return null;
+    function nearest(ll) {
+        let best = null, bd = Infinity;
+        for (const [k, c] of coordOf) {
+            const d = hav(ll.lat, ll.lng, c[0], c[1]);
+            if (d < bd) { bd = d; best = k; }
+        }
+        return best;
+    }
+    const startK = nearest(a), endK = nearest(b);
+    if (!startK || !endK) return null;
+
+    const dist = new Map(), prev = new Map(), done = new Set();
+    dist.set(startK, 0);
+    const pq = new MinHeap(); pq.push(startK, 0);
+    while (!pq.isEmpty()) {
+        const u = pq.pop().key;
+        if (done.has(u)) continue;
+        done.add(u);
+        if (u === endK) break;
+        const du = dist.get(u);
+        for (const { k: v, w } of (adj.get(u) || [])) {
+            if (done.has(v)) continue;
+            const nd = du + w;
+            if (nd < (dist.has(v) ? dist.get(v) : Infinity)) {
+                dist.set(v, nd); prev.set(v, u); const [tlat, tlon] = coordOf.get(endK);
+const [vlat, vlon] = coordOf.get(v);
+pq.push(v, nd + hav(vlat, vlon, tlat, tlon));
+            }
+        }
+    }
+    if (startK !== endK && !prev.has(endK)) return null;
+    const path = []; let cur = endK;
+    while (cur !== undefined) { path.push(coordOf.get(cur)); if (cur === startK) break; cur = prev.get(cur); }
+    path.reverse();
+    return path;
+}
+
+async function followRiverBetween(a, b) {
+    setLoad(true);
+    setStatus('FETCHING RIVER GEOMETRY…');
+    try {
+        const south = Math.min(a.lat, b.lat), north = Math.max(a.lat, b.lat);
+        const west = Math.min(a.lng, b.lng), east = Math.max(a.lng, b.lng);
+        const padLat = Math.max(0.01, (north - south) * 0.3);
+        const padLng = Math.max(0.01, (east - west) * 0.3);
+        const bbox = `${(south - padLat).toFixed(5)},${(west - padLng).toFixed(5)},${(north + padLat).toFixed(5)},${(east + padLng).toFixed(5)}`;
+        const q = `[out:json][timeout:60];way["waterway"~"^(river|stream|canal|drain|ditch|brook)$"](${bbox});out geom;`;
+        const data = await overpassFetch(q);
+        const riverName = (data.elements.find(el => el.tags && el.tags.name) || {}).tags?.name || 'UNNAMED';
+
+        const path = riverPath(data, a, b);
+        if (!path || path.length === 0) {
+    pts.push([b.lat, b.lng]); ptData.push(null); ptMeta.push(null);
+    renderMap();
+    setLoad(false);
+    setStatus('NO CONNECTED RIVER — STRAIGHT LEG ADDED');
+    toast('RIVERS NOT CONNECTED — ADDED STRAIGHT LEG');
+    return;
+}
+        // append the river course to the current border (skip a duplicate first vertex)
+        let added = 0;
+        for (const c of path) {
+            const last = pts[pts.length - 1];
+            if (last && hav(last[0], last[1], c[0], c[1]) < 0.00005) continue;
+
+            pts.push([c[0], c[1]]); ptData.push(null); ptMeta.push({ type: 'river', name: riverName }); added++;
+        }
+        renderMap();
+        setLoad(false);
+        setStatus(`RIVER TRACED — ${added} POINTS ADDED`);
+        toast(`RIVER TRACED — ${added} POINTS`);
+    } catch (err) {
+        console.error(err);
+        setLoad(false);
+        setStatus('RIVER FETCH FAILED');
+        toast('RIVER FETCH FAILED — TRY AGAIN');
+    }
+}
+
+document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key === '1') setMode(drawing ? 'idle' : 'drawing');
+    if (e.key === '2') setMode(followMode ? 'idle' : 'follow');
+    if (e.key === '3') { if (pts.length === 0) return; pts.pop(); ptData.pop(); ptMeta.pop(); renderMap(); toast('VERTEX REMOVED'); }
+    if (e.key === '4') document.getElementById('btn-clear').click();
+});
+
+map.on('click', async e => {
+    if (!followMode) return;
+    if (!riverStart) {
+        riverStart = e.latlng;
+        riverStartMarker = L.circleMarker(e.latlng, { radius: 6, color: '#00e890', fillColor: '#00e890', fillOpacity: 0.9, weight: 2 }).addTo(map);
+        setStatus('NOW CLICK THE DOWNSTREAM POINT ON THE SAME RIVER');
+        toast('UPSTREAM SET — CLICK DOWNSTREAM END');
+        return;
+    }
+    const end = e.latlng;
+    const startLL = riverStart;
+    if (riverStartMarker) { map.removeLayer(riverStartMarker); riverStartMarker = null; }
+    riverStart = null;
+    await followRiverBetween(startLL, end);
+    if (followMode) setStatus('FOLLOW RIVER — CLICK THE UPSTREAM POINT ON A RIVER');
 });
 
 function setStatus(msg) { document.getElementById('sb-status').textContent = msg; }
